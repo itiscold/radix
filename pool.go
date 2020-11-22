@@ -27,6 +27,7 @@ type ioErrConn struct {
 	lastIOErr error
 }
 
+// TODO this needs to be thread-safe
 func newIOErrConn(c Conn) *ioErrConn {
 	return &ioErrConn{Conn: c}
 }
@@ -49,6 +50,18 @@ func (ioc *ioErrConn) Do(ctx context.Context, a Action) error {
 func (ioc *ioErrConn) Close() error {
 	ioc.lastIOErr = io.EOF
 	return ioc.Conn.Close()
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+type bwFlushCallback struct {
+	resp.BufferedWriter
+	cb func()
+}
+
+func (bw bwFlushCallback) Flush() error {
+	bw.cb()
+	return bw.BufferedWriter.Flush()
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -172,6 +185,8 @@ func (cfg PoolConfig) withDefaults() PoolConfig {
 	if cfg.OverflowBufferDrainInterval == 0 {
 		cfg.OverflowBufferDrainInterval = 1 * time.Second
 	}
+
+	cfg.Dialer = cfg.Dialer.withDefaults()
 	return cfg
 }
 
@@ -198,6 +213,9 @@ type Pool struct {
 	cfg           PoolConfig
 	network, addr string
 	pool          chan *ioErrConn
+
+	useSharedConn bool
+	sharedConn    *ioErrConn
 }
 
 var _ Client = new(Pool)
@@ -219,11 +237,35 @@ func (cfg PoolConfig) New(ctx context.Context, network, addr string) (*Pool, err
 		panic("Cannot use PoolConfig.New with CustomPool")
 	}
 
+	cfg = cfg.withDefaults()
 	p := &Pool{
 		proc:    proc.New(),
-		cfg:     cfg.withDefaults(),
+		cfg:     cfg,
 		network: network,
 		addr:    addr,
+		useSharedConn: cfg.Size > 0 &&
+			cfg.Dialer.CustomDialer == nil &&
+			cfg.Dialer.WriteFlushInterval >= 0,
+	}
+
+	// if we're using a sharedConn we need to inject the callback into its
+	// BufferedWriter's Flush method, do that prior to making any connections.
+	if p.useSharedConn {
+		if p.cfg.Dialer.WriteFlushInterval == 0 {
+			p.cfg.Dialer.WriteFlushInterval = 250 * time.Microsecond
+		}
+		oldNewRespOpts := p.cfg.Dialer.NewRespOpts
+		p.cfg.Dialer.NewRespOpts = func() *resp.Opts {
+			opts := oldNewRespOpts()
+			oldGetBW := opts.GetBufferedWriter
+			opts.GetBufferedWriter = func(w io.Writer) resp.BufferedWriter {
+				return &bwFlushCallback{
+					BufferedWriter: oldGetBW(w),
+					cb:             p.onSharedConnFlush,
+				}
+			}
+			return opts
+		}
 	}
 
 	totalSize := p.cfg.Size + p.cfg.OverflowBufferSize
@@ -235,7 +277,14 @@ func (cfg PoolConfig) New(ctx context.Context, network, addr string) (*Pool, err
 	if err != nil {
 		return nil, err
 	}
-	p.put(ioc)
+
+	// if we're using a shared conn then just use this connection as that, might
+	// as well.
+	if p.useSharedConn {
+		p.sharedConn = ioc
+	} else {
+		p.put(ioc)
+	}
 
 	p.proc.Run(func(ctx context.Context) {
 		startTime := time.Now()
@@ -274,6 +323,25 @@ func (cfg PoolConfig) New(ctx context.Context, network, addr string) (*Pool, err
 		p.atIntervalDo(p.cfg.OverflowBufferDrainInterval, p.doOverflowDrain)
 	}
 	return p, nil
+}
+
+func (p *Pool) onSharedConnFlush() {
+	var toPut *ioErrConn
+	p.proc.WithLock(func() error {
+		select {
+		case ioc := <-p.pool:
+			toPut = p.sharedConn
+			p.sharedConn = ioc
+		default:
+			// there's not another conn available, keep using this one
+		}
+		return nil
+	})
+
+	// this must be done outside the WithLock because put calls WithRLock
+	if toPut != nil {
+		p.put(toPut)
+	}
 }
 
 func (p *Pool) traceInitCompleted(elapsedTime time.Duration) {
@@ -461,6 +529,12 @@ func (p *Pool) put(ioc *ioErrConn) bool {
 // of the pool, calling Perform on the given Action with it, and returning the
 // Conn to the pool.
 func (p *Pool) Do(ctx context.Context, a Action) error {
+	if p.useSharedConn && a.Properties().CanShareConn {
+		return p.proc.WithRLock(func() error {
+			return p.sharedConn.Do(ctx, a)
+		})
+	}
+
 	c, err := p.get(ctx)
 	if err != nil {
 		return err
@@ -475,7 +549,11 @@ func (p *Pool) Do(ctx context.Context, a Action) error {
 // NumAvailConns returns the number of connections currently available in the
 // pool, as well as in the overflow buffer if that option is enabled.
 func (p *Pool) NumAvailConns() int {
-	return len(p.pool)
+	var plusShared int
+	if p.useSharedConn {
+		plusShared = 1
+	}
+	return len(p.pool) + plusShared
 }
 
 func (p *Pool) drain() {
@@ -501,6 +579,9 @@ func (p *Pool) Close() error {
 	return p.proc.Close(func() error {
 		p.drain()
 		close(p.pool)
+		if p.useSharedConn {
+			p.sharedConn.Close()
+		}
 		if p.cfg.ErrCh != nil {
 			close(p.cfg.ErrCh)
 		}

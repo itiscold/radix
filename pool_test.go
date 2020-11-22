@@ -53,6 +53,7 @@ func TestPool(t *T) {
 	do := func(t *T, cfg PoolConfig) {
 		ctx := testCtx(t)
 		cfg.OverflowBufferSize = -1
+		cfg.Dialer.WriteFlushInterval = -1
 		cfg.Size = 10
 		pool := testPool(t, cfg)
 		var wg sync.WaitGroup
@@ -121,6 +122,7 @@ func TestPoolGet(t *T) {
 		pool := testPool(t, PoolConfig{
 			Size:               1,
 			OnEmptyCreateAfter: -1,
+			Dialer:             Dialer{WriteFlushInterval: -1},
 		})
 		conn, err := pool.get(ctx)
 		assert.NoError(t, err)
@@ -160,6 +162,7 @@ func TestPoolOnFull(t *T) {
 			Trace: trace.PoolTrace{ConnClosed: func(c trace.PoolConnClosed) {
 				reason = c.Reason
 			}},
+			Dialer: Dialer{WriteFlushInterval: -1},
 		})
 		defer pool.Close()
 		assert.Equal(t, 1, len(pool.pool))
@@ -177,6 +180,7 @@ func TestPoolOnFull(t *T) {
 			Size:                        1,
 			OverflowBufferSize:          1,
 			OverflowBufferDrainInterval: 1 * time.Second,
+			Dialer:                      Dialer{WriteFlushInterval: -1},
 		})
 		defer pool.Close()
 		assert.Equal(t, 1, len(pool.pool))
@@ -214,7 +218,8 @@ func TestPoolPut(t *T) {
 	ctx := testCtx(t)
 	size := 10
 	pool := testPool(t, PoolConfig{
-		Size: size,
+		Size:   size,
+		Dialer: Dialer{WriteFlushInterval: -1},
 	})
 
 	assertPoolConns := func(exp int) {
