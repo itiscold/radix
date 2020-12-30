@@ -57,17 +57,13 @@ func makeFailedFlagMap(addrs []string) map[string]bool {
 func TestClusterInitSync(t *T) {
 	scl := newStubCluster(testTopo)
 	serverAddrs := scl.addrs()
-	{
-		c := scl.newCluster()
-		err := c.Sync(true, false, true)
-		assert.NotNil(t, err)
-	}
+
 	//part of the addresses are unavailable during the initialization
 	//and recover after that, call Sync to test whether it can work
 	{
 		c, err := scl.newInitSyncErrorCluster(serverAddrs,
 			makeFailedFlagMap(serverAddrs[0:len(serverAddrs)/2]),
-			ClusterWithInitSyncSilent(true))
+			ClusterOnInitAllowUnavailable(true))
 		require.Nil(t, err)
 		defer c.Close()
 		//TestClusterSync
@@ -111,7 +107,7 @@ func TestClusterInitSync(t *T) {
 	{
 		c, err := scl.newInitSyncErrorCluster(serverAddrs,
 			makeFailedFlagMap(serverAddrs[len(serverAddrs)/2:]),
-			ClusterWithInitSyncSilent(true))
+			ClusterOnInitAllowUnavailable(true))
 		require.Nil(t, err)
 		defer c.Close()
 		// find the address's slot
@@ -135,6 +131,13 @@ func TestClusterInitSync(t *T) {
 		var vgot string
 		require.Nil(t, c.Do(Cmd(&vgot, "GET", k)))
 		assert.Equal(t, v, vgot)
+	}
+	//all addresses are unavailable and the call of NewCluster will get an error
+	{
+		_, err := scl.newInitSyncErrorCluster(serverAddrs,
+			makeFailedFlagMap(serverAddrs),
+			ClusterOnInitAllowUnavailable(true))
+		assert.NotNil(t, err)
 	}
 }
 
