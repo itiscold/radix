@@ -66,40 +66,7 @@ func TestClusterInitSync(t *T) {
 			ClusterOnInitAllowUnavailable(true))
 		require.Nil(t, err)
 		defer c.Close()
-		//TestClusterSync
-		assertClusterState := func() {
-			require.Nil(t, c.Sync())
-			c.l.RLock()
-			defer c.l.RUnlock()
-			assert.Equal(t, c.topo, scl.topo())
-			assert.Len(t, c.pools, len(c.topo))
-			for _, node := range c.topo {
-				assert.Contains(t, c.pools, node.Addr)
-			}
-		}
-		assertClusterState()
-
-		// cluster is unstable af
-		for i := 0; i < 10; i++ {
-			// find a usabel src/dst
-			var srcStub, dstStub *clusterNodeStub
-			for {
-				srcStub = scl.randStub()
-				dstStub = scl.randStub()
-				if srcStub.addr == dstStub.addr {
-					continue
-				} else if slotRanges := srcStub.slotRanges(); len(slotRanges) == 0 {
-					continue
-				}
-				break
-			}
-
-			// move src's first slot range to dst
-			slotRange := srcStub.slotRanges()[0]
-			t.Logf("moving %d:%d from %s to %s", slotRange[0], slotRange[1], srcStub.addr, dstStub.addr)
-			scl.migrateSlotRange(dstStub.addr, slotRange[0], slotRange[1])
-			assertClusterState()
-		}
+		require.Nil(t, c.Sync())
 	}
 
 	//part of the addresses are unavailable during the initialization
